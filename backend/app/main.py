@@ -82,16 +82,82 @@ def get_class_names() -> list[str]:
 
 @lru_cache(maxsize=1)
 def get_model() -> Any:
-    model_path_env = os.getenv("MODEL_PATH")
-    if model_path_env:
-        model_path = Path(model_path_env)
-    else:
-        model_path = next((p for p in DEFAULT_MODEL_CANDIDATES if p.exists()), None)
-    if model_path is None or not model_path.exists():
-        return None
-    if tf is None:
-        return None
-    return tf.keras.models.load_model(model_path)
+    try:
+        model_path_env = os.getenv("MODEL_PATH")
+        if model_path_env:
+            model_path = Path(model_path_env)
+        else:
+            model_path = next((p for p in DEFAULT_MODEL_CANDIDATES if p.exists()), None)
+        if model_path is None or not model_path.exists():
+            return None
+        if tf is None:
+            return None
+        
+        # 1. Monkeypatch base Layer constructor to discard any unsupported args globally
+        from tensorflow.keras.layers import Layer
+        if not hasattr(Layer, "_patched"):
+            original_layer_init = Layer.__init__
+            def patched_layer_init(self, *args, **kwargs):
+                kwargs.pop('quantization_config', None)
+                kwargs.pop('renorm', None)
+                kwargs.pop('renorm_clipping', None)
+                kwargs.pop('renorm_momentum', None)
+                original_layer_init(self, *args, **kwargs)
+            Layer.__init__ = patched_layer_init
+            Layer._patched = True
+            
+        try:
+            import keras
+            from keras.layers import Layer as KerasLayer
+            if not hasattr(KerasLayer, "_patched"):
+                original_keras_layer_init = KerasLayer.__init__
+                def patched_keras_layer_init(self, *args, **kwargs):
+                    kwargs.pop('quantization_config', None)
+                    kwargs.pop('renorm', None)
+                    kwargs.pop('renorm_clipping', None)
+                    kwargs.pop('renorm_momentum', None)
+                    original_keras_layer_init(self, *args, **kwargs)
+                KerasLayer.__init__ = patched_keras_layer_init
+                KerasLayer._patched = True
+        except Exception:
+            pass
+
+        # 2. Monkeypatch BatchNormalization to safely discard legacy Keras 2 arguments
+        from tensorflow.keras.layers import BatchNormalization
+        if not hasattr(BatchNormalization, "_patched"):
+            original_init = BatchNormalization.__init__
+            def patched_init(self, *args, **kwargs):
+                kwargs.pop('quantization_config', None)
+                kwargs.pop('renorm', None)
+                kwargs.pop('renorm_clipping', None)
+                kwargs.pop('renorm_momentum', None)
+                original_init(self, *args, **kwargs)
+            BatchNormalization.__init__ = patched_init
+            BatchNormalization._patched = True
+            
+        try:
+            import keras
+            from keras.layers import BatchNormalization as KerasBatchNormalization
+            if not hasattr(KerasBatchNormalization, "_patched"):
+                original_keras_init = KerasBatchNormalization.__init__
+                def patched_keras_init(self, *args, **kwargs):
+                    kwargs.pop('quantization_config', None)
+                    kwargs.pop('renorm', None)
+                    kwargs.pop('renorm_clipping', None)
+                    kwargs.pop('renorm_momentum', None)
+                    original_keras_init(self, *args, **kwargs)
+                KerasBatchNormalization.__init__ = patched_keras_init
+                KerasBatchNormalization._patched = True
+        except Exception:
+            pass
+        
+        # Load model tanpa kompilasi (compile=False) karena hanya digunakan untuk inferensi
+        return tf.keras.models.load_model(model_path, compile=False)
+    except Exception as e:
+        import traceback
+        print(f"FATAL MODEL LOAD ERROR: {e}")
+        traceback.print_exc()
+        return e
 
 
 @lru_cache(maxsize=1)
@@ -190,12 +256,25 @@ def _top_k_predictions(probabilities: np.ndarray, class_names: list[str], k: int
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    model_loaded = get_model() is not None
+    model_res = get_model()
+    model_loaded = model_res is not None and not isinstance(model_res, Exception)
+    error_msg = str(model_res) if isinstance(model_res, Exception) else None
+    
+    tf_version = tf.__version__ if tf is not None else None
+    keras_version = None
+    try:
+        import keras
+        keras_version = keras.__version__
+    except Exception:
+        pass
+        
     return {
         "status": "ok",
-        "tensorflow_available": tf is not None,
+        "tensorflow_version": tf_version,
+        "keras_version": keras_version,
         "model_loaded": model_loaded,
         "class_count": len(get_class_names()),
+        "error": error_msg,
     }
 
 
@@ -226,12 +305,11 @@ async def predict(file: UploadFile = File(...)) -> dict[str, Any]:
         }
 
     model = get_model()
-    if model is None:
+    if model is None or isinstance(model, Exception):
         raise HTTPException(
             status_code=503,
             detail=(
-                "Model belum siap. Jalankan pipeline training dulu hingga menghasilkan "
-                "backend/models/tomatoguard.h5."
+                f"Model belum siap atau gagal dimuat: {str(model) if isinstance(model, Exception) else 'file model tidak ditemukan'}."
             ),
         )
 
