@@ -1,0 +1,30 @@
+# Python Virtual Environments & Caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Project Datasets (DO NOT PUSH! Sangat besar untuk GitHub)
+datasets/
+
+# Node.js Dependencies (DO NOT PUSH! Gunakan npm install)
+node_modules/
+frontend/node_modules/
+
+# Build Outputs & Logs
+dist/
+frontend/dist/
+frontend/.vite/
+backend/logs/
+*.log
+
+# Model Weights & Training Checkpoints
+backend/models/
