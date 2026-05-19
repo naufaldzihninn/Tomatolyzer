@@ -8,7 +8,7 @@ import {
 } from 'lucide-react';
 
 // --- CONSTANTS ---
-const API_BASE = '/api';
+const API_BASE = import.meta.env.VITE_API_BASE || '/api';
 const HISTORY_KEY = 'tomatolyzer_history_v4';
 const MAX_HISTORY = 30;
 
