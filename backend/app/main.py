@@ -34,8 +34,13 @@ MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024
 IMAGE_SIZE = (224, 224)
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/jpg", "image/png"}
 MIN_GREEN_LEAF_RATIO = 0.025
-MIN_TOMATO_FALLBACK_CONFIDENCE = 0.20
-LOW_CONFIDENCE_THRESHOLD = 0.70
+MIN_MIXED_LEAF_GREEN_RATIO = 0.010
+MIN_MIXED_LEAF_COLOR_RATIO = 0.040
+MIN_STRONG_LEAF_GREEN_RATIO = 0.150
+MIN_LEAF_TEXTURE_STD = 12.0
+NON_PLANT_IMAGENET_REJECT_SCORE = 0.35
+MIN_TOMATO_ACCEPT_CONFIDENCE = 0.70
+MAX_NOT_TOMATO_COMPETING_CONFIDENCE = 0.35
 
 
 app = FastAPI(
@@ -171,29 +176,42 @@ def get_imagenet_model() -> Any:
     return tf.keras.applications.MobileNetV2(weights="imagenet")
 
 
+def _leaf_image_metrics(contents: bytes) -> dict[str, float]:
+    with Image.open(io.BytesIO(contents)) as img:
+        img = img.convert("RGB")
+        img = img.resize((64, 64))
+        arr = np.asarray(img, dtype=np.float32)
+
+    R, G, B = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+
+    green_mask = (G > R * 0.92) & (G > B * 1.02) & (G > 20)
+    green_ratio = float(np.mean(green_mask))
+
+    yellow_leaf_mask = (G > B * 1.05) & (R > B * 1.05) & (G > 35) & (R > 35)
+    leaf_color_ratio = float(np.mean(green_mask | yellow_leaf_mask))
+    texture_std = float(np.mean(arr, axis=2).std())
+
+    return {
+        "green_ratio": green_ratio,
+        "leaf_color_ratio": leaf_color_ratio,
+        "texture_std": texture_std,
+    }
+
+
+def _has_leaf_visual_signal(metrics: dict[str, float]) -> bool:
+    has_leaf_color = (
+        metrics["green_ratio"] >= MIN_GREEN_LEAF_RATIO
+        or (
+            metrics["green_ratio"] >= MIN_MIXED_LEAF_GREEN_RATIO
+            and metrics["leaf_color_ratio"] >= MIN_MIXED_LEAF_COLOR_RATIO
+        )
+    )
+    return has_leaf_color and metrics["texture_std"] >= MIN_LEAF_TEXTURE_STD
+
+
 def _is_green_leaf(contents: bytes) -> bool:
     try:
-        with Image.open(io.BytesIO(contents)) as img:
-            img = img.convert("RGB")
-            # Resize ke resolusi kecil agar proses ekstraksi piksel super cepat (<1ms)
-            img = img.resize((64, 64))
-            arr = np.asarray(img, dtype=np.float32)
-            
-        R, G, B = arr[:,:,0], arr[:,:,1], arr[:,:,2]
-        
-        # Heuristik Hijau Daun / Klorofil:
-        # Saluran hijau mendominasi merah (G > R * 0.92) dan biru (G > B * 1.02)
-        # Serta memiliki kecerahan minimal (G > 20) untuk menghindari noise gelap/hitam
-        green_mask = (G > R * 0.92) & (G > B * 1.02) & (G > 20)
-        # Daun sakit sering memiliki area kuning/cokelat. Tetap hitung klorosis sebagai sinyal daun
-        # selama biru tidak dominan dan piksel cukup terang.
-        yellow_leaf_mask = (G > B * 1.05) & (R > B * 1.05) & (G > 35) & (R > 35)
-        leaf_color_ratio = np.mean(green_mask | yellow_leaf_mask)
-        
-        # Minimal 2.5% dari seluruh piksel foto harus memiliki warna hijau/klorofil tumbuhan.
-        # Batasan ini sangat aman untuk daun tomat asli (yang rata-rata memiliki 20%-70% warna hijau/kuning),
-        # namun 100% menolak wajah manusia (0% hijau), langit biru, perabotan, dan background netral.
-        return float(leaf_color_ratio) >= MIN_GREEN_LEAF_RATIO
+        return _has_leaf_visual_signal(_leaf_image_metrics(contents))
     except Exception:
         # Jika terjadi error saat parsing gambar, kembalikan True agar tidak menghalangi request valid
         return True
@@ -237,6 +255,52 @@ def _is_plant_imagenet(contents: bytes) -> bool:
         return True
 
 
+def _is_clear_non_plant_imagenet(contents: bytes) -> bool:
+    try:
+        model = get_imagenet_model()
+        if model is None:
+            return False
+
+        with Image.open(io.BytesIO(contents)) as img:
+            img = img.convert("RGB")
+            img = img.resize((224, 224))
+            x = np.asarray(img, dtype=np.float32)
+
+        x = (x / 127.5) - 1.0
+        x = np.expand_dims(x, axis=0)
+
+        preds = model.predict(x, verbose=0)[0]
+
+        from tensorflow.keras.applications.mobilenet_v2 import decode_predictions
+        decoded = decode_predictions(np.expand_dims(preds, axis=0), top=5)[0]
+
+        plant_keywords = {
+            "leaf", "cabbage", "artichoke", "pepper", "pumpkin", "zucchini",
+            "cucumber", "fig", "pineapple", "acorn", "strawberry", "lemon",
+            "pomegranate", "daisy", "cardoon", "mushroom", "hay", "corn",
+            "broccoli", "cauliflower", "clover", "greenhouse", "flower",
+        }
+        non_plant_keywords = {
+            "person", "man", "woman", "groom", "suit", "jersey", "apron",
+            "mask", "helmet", "crash_helmet", "hard_hat", "sunglass",
+            "sunglasses", "gasmask", "oxygen_mask", "backpack", "coil",
+            "electrician", "construction", "uniform", "lab_coat",
+        }
+
+        has_plant_signal = False
+        non_plant_score = 0.0
+        for _, label, prob in decoded:
+            normalized = label.lower().replace("-", "_")
+            if any(kw in normalized for kw in plant_keywords):
+                has_plant_signal = True
+            if any(kw in normalized for kw in non_plant_keywords):
+                non_plant_score += float(prob)
+
+        return non_plant_score >= NON_PLANT_IMAGENET_REJECT_SCORE and not has_plant_signal
+    except Exception:
+        return False
+
+
 def _preprocess_image(contents: bytes) -> np.ndarray:
     with Image.open(io.BytesIO(contents)) as img:
         img = img.convert("RGB")
@@ -263,6 +327,26 @@ def _top_k_predictions(probabilities: np.ndarray, class_names: list[str], k: int
 def _is_not_tomato_class(class_name: str) -> bool:
     normalized = class_name.lower()
     return any(kw in normalized for kw in ("not tomato", "not_tomato", "bukan"))
+
+
+def _reject_not_tomato_leaf(
+    file_name: str | None,
+    reason: str,
+    message: str,
+    confidence: float = 0.0,
+    top3: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "prediction": "Not_Tomato_Leaf",
+        "confidence": confidence,
+        "top3": top3 or [
+            {"class_index": 0, "class_name": "Not Tomato Leaf", "confidence": confidence}
+        ],
+        "file_name": file_name,
+        "is_tomato_leaf": False,
+        "rejection_reason": reason,
+        "message": message,
+    }
 
 
 @app.get("/health")
@@ -303,21 +387,31 @@ async def predict(file: UploadFile = File(...)) -> dict[str, Any]:
     if len(contents) > MAX_FILE_SIZE_BYTES:
         raise HTTPException(status_code=400, detail="Ukuran file maksimal 5MB.")
 
-    # --- Pre-filter ringan untuk menolak gambar yang jelas bukan daun/tumbuhan ---
-    # ImageNet sengaja tidak dipakai sebagai hard gate karena foto daun lapangan sering
-    # diprediksi sebagai objek lain oleh model umum, lalu membuat false reject 100%.
-    if not _is_green_leaf(contents):
-        return {
-            "prediction": "Not_Tomato_Leaf",
-            "confidence": 0.0,
-            "top3": [
-                {"class_index": 0, "class_name": "Not Tomato Leaf", "confidence": 0.0}
-            ],
-            "file_name": file.filename,
-            "is_tomato_leaf": False,
-            "rejection_reason": "low_leaf_color_signal",
-            "message": "Gambar tidak memiliki cukup sinyal warna daun. Coba foto ulang dengan daun lebih jelas dan pencahayaan cukup.",
+    # --- Strict gate: hanya foto daun/tumbuhan yang diberi kesempatan masuk CNN tomat. ---
+    # Untuk mencegah barang/manusia dipaksa menjadi salah satu penyakit tomat, mode ini
+    # lebih memilih menolak foto meragukan daripada memberi diagnosis palsu.
+    try:
+        leaf_metrics = _leaf_image_metrics(contents)
+    except Exception:
+        leaf_metrics = {
+            "green_ratio": 0.0,
+            "leaf_color_ratio": 0.0,
+            "texture_std": 0.0,
         }
+
+    if not _has_leaf_visual_signal(leaf_metrics):
+        return _reject_not_tomato_leaf(
+            file.filename,
+            "low_leaf_color_signal",
+            "Gambar tidak memiliki cukup sinyal warna daun. Unggah foto daun tomat yang jelas dan memenuhi sebagian besar frame.",
+        )
+
+    if _is_clear_non_plant_imagenet(contents):
+        return _reject_not_tomato_leaf(
+            file.filename,
+            "clear_non_plant_object",
+            "Gambar terdeteksi sebagai objek non-tanaman. Unggah foto daun tomat yang memenuhi sebagian besar frame.",
+        )
 
     model = get_model()
     if model is None or isinstance(model, Exception):
@@ -335,40 +429,56 @@ async def predict(file: UploadFile = File(...)) -> dict[str, Any]:
     best = top3[0]
 
     is_tomato = not _is_not_tomato_class(best["class_name"])
-    low_confidence = False
-    warning = None
+    not_tomato_confidence = float(
+        max(
+            (
+                item["confidence"]
+                for item in top3
+                if _is_not_tomato_class(item["class_name"])
+            ),
+            default=0.0,
+        )
+    )
 
     if not is_tomato:
-        tomato_candidates = [
-            item for item in top3
-            if not _is_not_tomato_class(item["class_name"])
-        ]
-        # Jika foto sudah lolos filter warna daun, jangan buru-buru ditolak hanya karena
-        # kelas negatif sintetis menang tipis/terlalu percaya. Pakai kandidat tomat terbaik
-        # sebagai diagnosis low-confidence agar foto lapangan tetap bisa dianalisis.
-        if tomato_candidates and tomato_candidates[0]["confidence"] >= MIN_TOMATO_FALLBACK_CONFIDENCE:
-            best = tomato_candidates[0]
-            is_tomato = True
-            low_confidence = True
-            warning = (
-                "Model sempat mengarah ke kelas bukan daun tomat, tetapi foto memiliki sinyal daun. "
-                "Diagnosis ditampilkan sebagai estimasi awal dengan confidence rendah."
-            )
-        else:
-            return {
-                "prediction": best["class_name"],
-                "confidence": best["confidence"],
-                "top3": top3,
-                "file_name": file.filename,
-                "is_tomato_leaf": False,
-                "rejection_reason": "model_not_tomato_leaf",
-                "message": "Model belum menemukan kandidat penyakit daun tomat yang cukup kuat pada gambar ini.",
-            }
+        return _reject_not_tomato_leaf(
+            file.filename,
+            "model_not_tomato_leaf",
+            "Model menilai gambar ini bukan daun tomat.",
+            confidence=best["confidence"],
+            top3=top3,
+        )
 
-    if best["confidence"] < LOW_CONFIDENCE_THRESHOLD:
-        low_confidence = True
-        warning = warning or (
-            "Model kurang yakin pada foto ini. Gunakan hasil sebagai indikasi awal dan coba foto ulang daun dari jarak lebih dekat."
+    if best["confidence"] < MIN_TOMATO_ACCEPT_CONFIDENCE:
+        return _reject_not_tomato_leaf(
+            file.filename,
+            "low_tomato_confidence",
+            "Model belum cukup yakin bahwa gambar ini daun tomat. Coba foto ulang daun dari jarak lebih dekat.",
+            confidence=best["confidence"],
+            top3=top3,
+        )
+
+    if not_tomato_confidence >= MAX_NOT_TOMATO_COMPETING_CONFIDENCE:
+        return _reject_not_tomato_leaf(
+            file.filename,
+            "not_tomato_competing_prediction",
+            "Model masih melihat kemungkinan kuat bahwa gambar bukan daun tomat. Unggah foto daun tomat yang lebih jelas.",
+            confidence=not_tomato_confidence,
+            top3=top3,
+        )
+
+    is_plant_like = _is_plant_imagenet(contents)
+    has_strong_leaf_visual = (
+        leaf_metrics["green_ratio"] >= MIN_STRONG_LEAF_GREEN_RATIO
+        and leaf_metrics["texture_std"] >= MIN_LEAF_TEXTURE_STD
+    )
+    if not is_plant_like and not has_strong_leaf_visual:
+        return _reject_not_tomato_leaf(
+            file.filename,
+            "not_recognized_as_leaf_or_plant",
+            "Gambar belum cukup kuat dikenali sebagai daun/tanaman. Unggah foto daun tomat yang lebih dekat, tajam, dan minim objek lain.",
+            confidence=best["confidence"],
+            top3=top3,
         )
 
     return {
@@ -377,6 +487,6 @@ async def predict(file: UploadFile = File(...)) -> dict[str, Any]:
         "top3": top3,
         "file_name": file.filename,
         "is_tomato_leaf": is_tomato,
-        "low_confidence": low_confidence,
-        "warning": warning,
+        "low_confidence": False,
+        "warning": None,
     }
