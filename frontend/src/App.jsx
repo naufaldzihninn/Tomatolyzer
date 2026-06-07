@@ -367,6 +367,7 @@ export default function Tomatolyzer() {
           image: imagePreview,
           timestamp: new Date().toLocaleString('id-ID'),
           rejected: true,
+          message: payload.message || 'Gambar yang diunggah belum cukup jelas sebagai daun tomat untuk dianalisis.',
           primary: {
             id: 'not_tomato_leaf',
             name: 'Bukan Daun Tomat',
@@ -414,6 +415,8 @@ export default function Tomatolyzer() {
         id: Date.now(),
         image: imagePreview,
         timestamp: new Date().toLocaleString('id-ID'),
+        lowConfidence: Boolean(payload.low_confidence),
+        warning: payload.warning,
         primary: {
           id: primaryId,
           name: primaryName,
@@ -651,7 +654,7 @@ export default function Tomatolyzer() {
               </div>
               <h3 className="text-3xl font-black text-red-700 mb-3">Bukan Daun Tomat</h3>
               <p className="text-slate-600 text-lg mb-6 leading-relaxed">
-                Model AI mendeteksi bahwa gambar ini <strong>bukan daun tomat</strong> dengan keyakinan <span className="font-bold text-red-600">{result.primary.confidence}%</span>.
+                {result.message}
               </p>
               <div className="bg-white rounded-2xl p-6 border border-amber-200 shadow-sm mb-8 text-left">
                 <h4 className="font-bold text-slate-800 mb-3 flex items-center gap-2">
@@ -722,6 +725,15 @@ export default function Tomatolyzer() {
                   <p className="text-slate-600 text-[15px] sm:text-base mb-8 leading-relaxed flex-1 font-medium pl-4 border-l-3 border-slate-200">
                     {result.primary.desc}
                   </p>
+
+                  {result.warning && (
+                    <div className="mb-6 flex items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-left">
+                      <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                      <p className="text-sm font-semibold leading-relaxed text-amber-800">
+                        {result.warning}
+                      </p>
+                    </div>
+                  )}
 
                   {/* Diagnostic Action Console */}
                   <div className={`rounded-2xl p-6 border ${result.primary.border} bg-gradient-to-br from-slate-50 to-white/30 shadow-sm relative overflow-hidden group/console`}>

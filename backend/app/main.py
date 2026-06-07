@@ -33,6 +33,9 @@ CLASS_NAMES_PATH = MODELS_DIR / "class_names.json"
 MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024
 IMAGE_SIZE = (224, 224)
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/jpg", "image/png"}
+MIN_GREEN_LEAF_RATIO = 0.025
+MIN_TOMATO_FALLBACK_CONFIDENCE = 0.20
+LOW_CONFIDENCE_THRESHOLD = 0.70
 
 
 app = FastAPI(
@@ -182,12 +185,15 @@ def _is_green_leaf(contents: bytes) -> bool:
         # Saluran hijau mendominasi merah (G > R * 0.92) dan biru (G > B * 1.02)
         # Serta memiliki kecerahan minimal (G > 20) untuk menghindari noise gelap/hitam
         green_mask = (G > R * 0.92) & (G > B * 1.02) & (G > 20)
-        green_ratio = np.mean(green_mask)
+        # Daun sakit sering memiliki area kuning/cokelat. Tetap hitung klorosis sebagai sinyal daun
+        # selama biru tidak dominan dan piksel cukup terang.
+        yellow_leaf_mask = (G > B * 1.05) & (R > B * 1.05) & (G > 35) & (R > 35)
+        leaf_color_ratio = np.mean(green_mask | yellow_leaf_mask)
         
         # Minimal 2.5% dari seluruh piksel foto harus memiliki warna hijau/klorofil tumbuhan.
         # Batasan ini sangat aman untuk daun tomat asli (yang rata-rata memiliki 20%-70% warna hijau/kuning),
         # namun 100% menolak wajah manusia (0% hijau), langit biru, perabotan, dan background netral.
-        return float(green_ratio) >= 0.025
+        return float(leaf_color_ratio) >= MIN_GREEN_LEAF_RATIO
     except Exception:
         # Jika terjadi error saat parsing gambar, kembalikan True agar tidak menghalangi request valid
         return True
@@ -254,6 +260,11 @@ def _top_k_predictions(probabilities: np.ndarray, class_names: list[str], k: int
     return result
 
 
+def _is_not_tomato_class(class_name: str) -> bool:
+    normalized = class_name.lower()
+    return any(kw in normalized for kw in ("not tomato", "not_tomato", "bukan"))
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     model_res = get_model()
@@ -292,16 +303,20 @@ async def predict(file: UploadFile = File(...)) -> dict[str, Any]:
     if len(contents) > MAX_FILE_SIZE_BYTES:
         raise HTTPException(status_code=400, detail="Ukuran file maksimal 5MB.")
 
-    # --- Pre-filter Heuristic untuk Deteksi Hijau Daun / Tumbuhan ---
-    if not _is_green_leaf(contents) or not _is_plant_imagenet(contents):
+    # --- Pre-filter ringan untuk menolak gambar yang jelas bukan daun/tumbuhan ---
+    # ImageNet sengaja tidak dipakai sebagai hard gate karena foto daun lapangan sering
+    # diprediksi sebagai objek lain oleh model umum, lalu membuat false reject 100%.
+    if not _is_green_leaf(contents):
         return {
             "prediction": "Not_Tomato_Leaf",
-            "confidence": 1.0,
+            "confidence": 0.0,
             "top3": [
-                {"class_index": 0, "class_name": "Not Tomato Leaf", "confidence": 1.0}
+                {"class_index": 0, "class_name": "Not Tomato Leaf", "confidence": 0.0}
             ],
             "file_name": file.filename,
             "is_tomato_leaf": False,
+            "rejection_reason": "low_leaf_color_signal",
+            "message": "Gambar tidak memiliki cukup sinyal warna daun. Coba foto ulang dengan daun lebih jelas dan pencahayaan cukup.",
         }
 
     model = get_model()
@@ -319,15 +334,42 @@ async def predict(file: UploadFile = File(...)) -> dict[str, Any]:
     top3 = _top_k_predictions(preds, class_names, k=3)
     best = top3[0]
 
-    _NOT_TOMATO_KEYWORDS = ("not tomato", "not_tomato", "bukan")
-    is_tomato = not any(kw in best["class_name"].lower() for kw in _NOT_TOMATO_KEYWORDS)
+    is_tomato = not _is_not_tomato_class(best["class_name"])
+    low_confidence = False
+    warning = None
 
-    # Heuristic OOD Filter: 
-    # Model MobileNetV2 ini sangat akurat pada daun tomat asli (confidence biasanya > 95%).
-    # Objek asing (seperti tangan) akan dipaksa masuk ke kelas dominan, namun dengan
-    # confidence yang tertahan (biasanya 60% - 85%).
-    if is_tomato and best["confidence"] < 0.90:
-        is_tomato = False
+    if not is_tomato:
+        tomato_candidates = [
+            item for item in top3
+            if not _is_not_tomato_class(item["class_name"])
+        ]
+        # Jika foto sudah lolos filter warna daun, jangan buru-buru ditolak hanya karena
+        # kelas negatif sintetis menang tipis/terlalu percaya. Pakai kandidat tomat terbaik
+        # sebagai diagnosis low-confidence agar foto lapangan tetap bisa dianalisis.
+        if tomato_candidates and tomato_candidates[0]["confidence"] >= MIN_TOMATO_FALLBACK_CONFIDENCE:
+            best = tomato_candidates[0]
+            is_tomato = True
+            low_confidence = True
+            warning = (
+                "Model sempat mengarah ke kelas bukan daun tomat, tetapi foto memiliki sinyal daun. "
+                "Diagnosis ditampilkan sebagai estimasi awal dengan confidence rendah."
+            )
+        else:
+            return {
+                "prediction": best["class_name"],
+                "confidence": best["confidence"],
+                "top3": top3,
+                "file_name": file.filename,
+                "is_tomato_leaf": False,
+                "rejection_reason": "model_not_tomato_leaf",
+                "message": "Model belum menemukan kandidat penyakit daun tomat yang cukup kuat pada gambar ini.",
+            }
+
+    if best["confidence"] < LOW_CONFIDENCE_THRESHOLD:
+        low_confidence = True
+        warning = warning or (
+            "Model kurang yakin pada foto ini. Gunakan hasil sebagai indikasi awal dan coba foto ulang daun dari jarak lebih dekat."
+        )
 
     return {
         "prediction": best["class_name"],
@@ -335,4 +377,6 @@ async def predict(file: UploadFile = File(...)) -> dict[str, Any]:
         "top3": top3,
         "file_name": file.filename,
         "is_tomato_leaf": is_tomato,
+        "low_confidence": low_confidence,
+        "warning": warning,
     }
